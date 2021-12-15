@@ -11,9 +11,10 @@ import kotlin.concurrent.withLock
  * [K] is the type of entity ID
  */
 class EntityLocker<K : Any> {
+    private val keyToLockCount = mutableMapOf<K, LockCount>()
     private val globalLock = ReentrantLock()
     private val globalMonitor = globalLock.newCondition()
-    private val keyToLockCount = mutableMapOf<K, LockCount>()
+    private var globalLockCount: LockCount? = null
 
     /**
      * executes [protectedCode] exclusively accessing entity determined by [key]
@@ -38,8 +39,12 @@ class EntityLocker<K : Any> {
      * should wait until the entity becomes available.
      * Reentrant invocation is allowed.
      */
-    inline fun <T> withGlobalLock(protectedCode: () -> T): T {
-        TODO()
+    inline fun <T> withGlobalLock(protectedCode: () -> T): T = globalLock().run {
+        try {
+            protectedCode()
+        } finally {
+            globalUnlock()
+        }
     }
 
     /**
@@ -54,9 +59,10 @@ class EntityLocker<K : Any> {
      */
     @PublishedApi
     internal fun lock(key: K): Unit = globalLock.withLock {
-        while ((keyToLockCount[key]?.count ?: 0) > 0 && keyToLockCount[key]?.thread !== Thread.currentThread()) {
-            globalMonitor.await()
-        }
+        while (
+            (keyToLockCount[key]?.count ?: 0) > 0 && keyToLockCount[key]?.thread !== Thread.currentThread() ||
+            isGloballyLocked()
+        ) globalMonitor.await()
         keyToLockCount.computeIfAbsent(key) { LockCount() }.inc()
     }
 
@@ -71,6 +77,28 @@ class EntityLocker<K : Any> {
             if (lockCont.count == 0) {
                 keyToLockCount.remove(key)
                 globalMonitor.signalAll()
+            }
+        }
+    }
+
+    @PublishedApi
+    internal fun globalLock(): Unit = globalLock.withLock {
+        while (isGloballyLocked() || keyToLockCount.values.any { it.count > 0 }) globalMonitor.await()
+        globalLockCount = (globalLockCount ?: LockCount()).inc()
+    }
+
+    private fun isGloballyLocked() =
+        (globalLockCount?.count ?: 0) > 0 && globalLockCount?.thread !== Thread.currentThread()
+
+    @PublishedApi
+    internal fun globalUnlock(): Unit = globalLock.withLock {
+        globalLockCount?.let {
+            if (it.thread === Thread.currentThread()) {
+                it.dec()
+                if (it.count == 0) {
+                    globalLockCount = null
+                    globalMonitor.signalAll()
+                }
             }
         }
     }

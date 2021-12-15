@@ -95,7 +95,7 @@ internal class EntityLockerTest {
     }
 
     @Test
-    fun `withGlobalLock sequential execution`() {
+    fun `withGlobalLock sequential execution local before global`() {
         // given
         val eventQueue = ConcurrentLinkedQueue<Event>()
         val locker = EntityLocker<String>()
@@ -106,8 +106,7 @@ internal class EntityLockerTest {
         }
         val fooThread1 = Thread { locker.withLock("foo", protectedCode) }
         val globalThread = Thread { locker.withGlobalLock(protectedCode) }
-        val fooThread2 = Thread { locker.withLock("foo", protectedCode) }
-        val threads = listOf(fooThread1, globalThread, fooThread2)
+        val threads = listOf(fooThread1, globalThread)
         // when
         threads.forEach {
             it.start()
@@ -121,9 +120,34 @@ internal class EntityLockerTest {
         // fooThread1 should be executed before globalThread
         assertThat(threadToNameToTime[fooThread1, end])
             .isLessThan(threadToNameToTime[globalThread, start])
-        // globalThread should be executed before fooThread2
+    }
+
+    @Test
+    fun `withGlobalLock sequential execution global before local`() {
+        // given
+        val eventQueue = ConcurrentLinkedQueue<Event>()
+        val locker = EntityLocker<String>()
+        val protectedCode = {
+            eventQueue.offer(Event(start))
+            Thread.sleep(1000)
+            eventQueue.offer(Event(end))
+        }
+        val fooThread1 = Thread { locker.withLock("foo", protectedCode) }
+        val globalThread = Thread { locker.withGlobalLock(protectedCode) }
+        val threads = listOf(globalThread, fooThread1)
+        // when
+        threads.forEach {
+            it.start()
+            Thread.sleep(250)
+        }
+        threads.forEach(Thread::join)
+        // then
+        val threadToNameToTime = eventQueue.groupBy(Event::thread).mapValues { (_, events) ->
+            events.associate { it.name to it.time }
+        }
+        // globalThread should be executed before fooThread1
         assertThat(threadToNameToTime[globalThread, end])
-            .isLessThan(threadToNameToTime[fooThread2, start])
+            .isLessThan(threadToNameToTime[fooThread1, start])
     }
 
     @Test
