@@ -93,4 +93,49 @@ internal class EntityLockerTest {
         assertThat(reentered).isTrue()
         assertThat(finished).isTrue()
     }
+
+    @Test
+    fun `withGlobalLock sequential execution`() {
+        // given
+        val eventQueue = ConcurrentLinkedQueue<Event>()
+        val locker = EntityLocker<String>()
+        val protectedCode = {
+            eventQueue.offer(Event(start))
+            Thread.sleep(1000)
+            eventQueue.offer(Event(end))
+        }
+        val fooThread1 = Thread { locker.withLock("foo", protectedCode) }
+        val globalThread = Thread { locker.withGlobalLock(protectedCode) }
+        val fooThread2 = Thread { locker.withLock("foo", protectedCode) }
+        val threads = listOf(fooThread1, globalThread, fooThread2)
+        // when
+        threads.forEach {
+            it.start()
+            Thread.sleep(250)
+        }
+        threads.forEach(Thread::join)
+        // then
+        val threadToNameToTime = eventQueue.groupBy(Event::thread).mapValues { (_, events) ->
+            events.associate { it.name to it.time }
+        }
+        // fooThread1 should be executed before globalThread
+        assertThat(threadToNameToTime[fooThread1, end])
+            .isLessThan(threadToNameToTime[globalThread, start])
+        // globalThread should be executed before fooThread2
+        assertThat(threadToNameToTime[globalThread, end])
+            .isLessThan(threadToNameToTime[fooThread2, start])
+    }
+
+    @Test
+    fun `withGlobalLock reentrant execution`() {
+        val locker = EntityLocker<String>()
+        var reentered = false
+        var finished = false
+        Thread {
+            locker.withGlobalLock { locker.withGlobalLock { reentered = true } }
+            finished = true
+        }.apply(Thread::start).join(500)
+        assertThat(reentered).isTrue()
+        assertThat(finished).isTrue()
+    }
 }
