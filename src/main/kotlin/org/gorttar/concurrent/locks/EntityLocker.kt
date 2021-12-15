@@ -12,8 +12,8 @@ import kotlin.concurrent.withLock
  */
 class EntityLocker<K : Any> {
     private val globalLock = ReentrantLock()
-    private val syncCondition = globalLock.newCondition()
-    private val keyToLockCount = mutableMapOf<K, LockCont>()
+    private val globalMonitor = globalLock.newCondition()
+    private val keyToLockCount = mutableMapOf<K, LockCount>()
 
     /**
      * executes [protectedCode] exclusively accessing entity determined by [key]
@@ -31,27 +31,52 @@ class EntityLocker<K : Any> {
         }
     }
 
+    /**
+     * executes [protectedCode] exclusively
+     * ensuring that at most one [Thread] executes protected code on any entity
+     * If there’s a concurrent request to lock any entity, the other thread
+     * should wait until the entity becomes available.
+     * Reentrant invocation is allowed.
+     */
+    inline fun <T> withGlobalLock(protectedCode: () -> T): T {
+        TODO()
+    }
+
+    /**
+     * Acquires the lock on [key] according to the following strategy:
+     * lock on [key] isn't held by another thread -> acquires and returns immediately
+     * lock on [key] is already held by [Thread.currentThread] -> increment associated [LockCount]
+     *      and returns immediately
+     * else -> the current thread becomes disabled for thread scheduling purposes and lies dormant until the locks
+     *      has been acquired, at which time the locks hold count is set to one.
+     *
+     * This fun is internal in order to prevent [EntityLocker] user from lock leaks
+     */
     @PublishedApi
     internal fun lock(key: K): Unit = globalLock.withLock {
         while ((keyToLockCount[key]?.count ?: 0) > 0 && keyToLockCount[key]?.thread !== Thread.currentThread()) {
-            syncCondition.await()
+            globalMonitor.await()
         }
-        keyToLockCount[key] = (keyToLockCount[key] ?: LockCont()).inc()
+        keyToLockCount.computeIfAbsent(key) { LockCount() }.inc()
     }
 
+    /**
+     * Attempts to release the lock on [key]
+     * This fun is internal in order to prevent [EntityLocker] user from misuse e.g. attempting to release not held lock
+     */
     @PublishedApi
     internal fun unlock(key: K): Unit = globalLock.withLock {
         if (keyToLockCount[key]?.thread === Thread.currentThread()) {
             val lockCont = keyToLockCount[key]!!.dec()
             if (lockCont.count == 0) {
                 keyToLockCount.remove(key)
-                syncCondition.signalAll()
+                globalMonitor.signalAll()
             }
         }
     }
 }
 
-private class LockCont {
+private class LockCount {
     val thread: Thread = Thread.currentThread()
     var count = 0
         private set
