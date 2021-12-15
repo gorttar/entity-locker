@@ -11,9 +11,10 @@ repositories {
 }
 
 dependencies {
-    implementation(kotlin("stdlib"))
-    testImplementation("org.junit.jupiter:junit-jupiter-api:5.6.0")
-    testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine")
+    implementation(group = "org.jetbrains.kotlin", name = "kotlin-stdlib", version = "1.6.0")
+    testImplementation(group = "org.junit.jupiter", name = "junit-jupiter-api", version = "5.8.2")
+    testRuntimeOnly(group = "org.junit.jupiter", name = "junit-jupiter-engine", version = "5.8.2")
+    testImplementation(group = "com.willowtreeapps.assertk", name = "assertk", version = "0.25")
 }
 
 tasks.getByName<Test>("test") {
