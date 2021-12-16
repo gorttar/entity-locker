@@ -11,8 +11,9 @@ import kotlin.concurrent.withLock
  * [EntityLocker] itself does not deal with the entities, only with the IDs (primary keys) of the entities.
  * [K] is the type of entity ID
  */
-class EntityLocker<K : Any> {
+class EntityLocker<K : Any>(private val globalLockThreshold: Int = 10) {
     private val keyToLockCount = mutableMapOf<K, LockCount>()
+    private val threadToLockedKeys = mutableMapOf<Thread, MutableSet<K>>()
     private val globalLock = ReentrantLock()
     private val globalMonitor = globalLock.newCondition()
     private var globalLockCount: LockCount? = null
@@ -60,15 +61,27 @@ class EntityLocker<K : Any> {
         }
     }
 
-    inline fun <T> withTryGlobalLock(timeout: Long, protectedCode: () -> T): TryLockResult<T> {
-        return tryGlobalLock(timeout).takeIf { it }?.run {
-            try {
-                Success(protectedCode())
-            } finally {
-                globalUnlock()
-            }
-        } ?: TimeoutExceeded
-    }
+    /**
+     * tries to start execution of [protectedCode] exclusively
+     * within at most [timeout] milliseconds
+     * ensuring that at most one [Thread] executes protected code on any entity
+     * If there’s a concurrent request to lock any entity, the other thread
+     * should wait until the entity becomes available.
+     *
+     * @return
+     * *    [protectedCode] execution was started -> [Success] instance wrapping the result
+     * *    unable to start execution during [timeout] -> [TimeoutExceeded] object
+     */
+    inline fun <T> withTryGlobalLock(
+        timeout: Long,
+        protectedCode: () -> T
+    ): TryLockResult<T> = tryGlobalLock(timeout).takeIf { it }?.run {
+        try {
+            Success(protectedCode())
+        } finally {
+            globalUnlock()
+        }
+    } ?: TimeoutExceeded
 
     /**
      * Acquires the lock on [key] according to the following strategy:
@@ -83,37 +96,49 @@ class EntityLocker<K : Any> {
     @PublishedApi
     internal fun lock(key: K): Unit = globalLock.withLock {
         while (isLocked(key) || isGloballyLocked()) globalMonitor.await()
-        keyToLockCount.computeIfAbsent(key) { LockCount() }.inc()
+        if (isTooManyLockedKeys()) globalLock()
+        else acquireLock(key)
     }
 
     /**
-     * Attempts to release the lock on [key]
      * This fun is internal in order to prevent [EntityLocker] user from misuse e.g. attempting to release not held lock
      */
     @PublishedApi
     internal fun unlock(key: K): Unit = globalLock.withLock {
-        if (keyToLockCount[key]?.thread === Thread.currentThread()) {
-            val lockCont = keyToLockCount[key]?.dec()
-            if (lockCont?.count == 0) {
-                keyToLockCount.remove(key)
-                globalMonitor.signalAll()
+        when {
+            isGloballyLocked() -> globalUnlock()
+            keyToLockCount[key]?.thread === Thread.currentThread() -> {
+                val lockCont = keyToLockCount[key]?.dec()
+                if (lockCont?.count == 0) {
+                    keyToLockCount -= key
+                    threadToLockedKeys.computeIfPresent(Thread.currentThread()) { _, keys ->
+                        keys -= key
+                        keys.takeIf { it.isNotEmpty() }
+                    }
+                    globalMonitor.signalAll()
+                }
             }
         }
     }
 
     @PublishedApi
     internal fun tryLock(key: K, timeout: Long): Boolean = globalLock.withLock {
-        if (isLocked(key) || isGloballyLocked()) globalMonitor.await(timeout, MILLISECONDS)
-        if (!isLocked(key) && !isGloballyLocked()) {
-            keyToLockCount.computeIfAbsent(key) { LockCount() }.inc()
-            true
+        val start = System.currentTimeMillis()
+        if (awaitFor(timeout) { !isLocked(key) && !isGloballyLocked() }) {
+            if (isTooManyLockedKeys()) {
+                val remainingTime = timeout - System.currentTimeMillis() + start
+                if (remainingTime > 0) tryGlobalLock(remainingTime) else false
+            } else {
+                acquireLock(key)
+                true
+            }
         } else false
     }
 
     @PublishedApi
     internal fun globalLock(): Unit = globalLock.withLock {
         while (isGloballyLocked() || isAnyLocked()) globalMonitor.await()
-        globalLockCount = (globalLockCount ?: LockCount()).inc()
+        acquireGlobalLock()
     }
 
     @PublishedApi
@@ -131,14 +156,23 @@ class EntityLocker<K : Any> {
 
     @PublishedApi
     internal fun tryGlobalLock(timeout: Long): Boolean = globalLock.withLock {
-        if (isGloballyLocked() || isAnyLocked()) globalMonitor.await(
-            timeout,
-            MILLISECONDS
-        )
-        if (!isGloballyLocked() && !isAnyLocked()) {
-            globalLockCount = (globalLockCount ?: LockCount()).inc()
+        if (awaitFor(timeout) { !isGloballyLocked() && !isAnyLocked() }) {
+            acquireGlobalLock()
             true
         } else false
+    }
+
+    private fun isTooManyLockedKeys() = threadToLockedKeys[Thread.currentThread()].orEmpty().size >= globalLockThreshold
+
+    private fun acquireGlobalLock() {
+        keyToLockCount.clear()
+        threadToLockedKeys.clear()
+        globalLockCount = (globalLockCount ?: LockCount()).inc()
+    }
+
+    private fun acquireLock(key: K) {
+        keyToLockCount.computeIfAbsent(key) { LockCount() }.inc()
+        threadToLockedKeys.computeIfAbsent(Thread.currentThread()) { mutableSetOf() } += key
     }
 
     private fun isAnyLocked() = keyToLockCount.values.any { it.count > 0 }
@@ -148,6 +182,16 @@ class EntityLocker<K : Any> {
 
     private fun isLocked(key: K) =
         (keyToLockCount[key]?.count ?: 0) > 0 && keyToLockCount[key]?.thread !== Thread.currentThread()
+
+    private inline fun awaitFor(timeout: Long, predicate: () -> Boolean): Boolean {
+        val start = System.currentTimeMillis()
+        while (!predicate()) {
+            val spent = System.currentTimeMillis() - start
+            if (spent >= timeout) break
+            globalMonitor.await(timeout - spent, MILLISECONDS)
+        }
+        return predicate()
+    }
 }
 
 private class LockCount {
