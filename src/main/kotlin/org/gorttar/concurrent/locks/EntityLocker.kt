@@ -61,7 +61,13 @@ class EntityLocker<K : Any> {
     }
 
     inline fun <T> withTryGlobalLock(timeout: Long, protectedCode: () -> T): TryLockResult<T> {
-        TODO()
+        return tryGlobalLock(timeout).takeIf { it }?.run {
+            try {
+                Success(protectedCode())
+            } finally {
+                globalUnlock()
+            }
+        } ?: TimeoutExceeded
     }
 
     /**
@@ -106,7 +112,7 @@ class EntityLocker<K : Any> {
 
     @PublishedApi
     internal fun globalLock(): Unit = globalLock.withLock {
-        while (isGloballyLocked() || keyToLockCount.values.any { it.count > 0 }) globalMonitor.await()
+        while (isGloballyLocked() || isAnyLocked()) globalMonitor.await()
         globalLockCount = (globalLockCount ?: LockCount()).inc()
     }
 
@@ -122,6 +128,20 @@ class EntityLocker<K : Any> {
             }
         }
     }
+
+    @PublishedApi
+    internal fun tryGlobalLock(timeout: Long): Boolean = globalLock.withLock {
+        if (isGloballyLocked() || isAnyLocked()) globalMonitor.await(
+            timeout,
+            MILLISECONDS
+        )
+        if (!isGloballyLocked() && !isAnyLocked()) {
+            globalLockCount = (globalLockCount ?: LockCount()).inc()
+            true
+        } else false
+    }
+
+    private fun isAnyLocked() = keyToLockCount.values.any { it.count > 0 }
 
     private fun isGloballyLocked() =
         (globalLockCount?.count ?: 0) > 0 && globalLockCount?.thread !== Thread.currentThread()
