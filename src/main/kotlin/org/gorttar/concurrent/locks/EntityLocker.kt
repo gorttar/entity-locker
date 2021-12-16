@@ -10,6 +10,33 @@ import kotlin.concurrent.withLock
  * and caching of different type of entities in the application.
  * [EntityLocker] itself does not deal with the entities, only with the IDs (primary keys) of the entities.
  * [K] is the type of entity ID
+ *
+ * Implemented requirements:
+ * *    [EntityLocker] should support different types of entity IDs.
+ * *        @see [K] type parameter
+ * *    [EntityLocker] interface should allow the caller to specify which entity does it want
+ * *        to work with (using entity ID), and designate the boundaries of the code that should have exclusive access
+ * *        to the entity (called “protected code”).
+ * *        @see [withLock], [withTryLock]
+ * *    For any given entity, [EntityLocker] should guarantee that at most one thread executes
+ * *        protected code on that entity.
+ * *        If there’s a concurrent request to lock the same entity, the other thread should wait
+ * *        until the entity becomes available.
+ * *    [EntityLocker] should allow concurrent execution of protected code on different entities.
+ *
+ * Implemented bonus requirements:
+ * *    Allow reentrant locking.
+ * *    Allow the caller to specify timeout for locking an entity.
+ * *        @see [withTryLock], [withTryGlobalLock]
+ * *    Implement global lock. Protected code that executes under a global lock must not execute concurrently
+ * *        with any other protected code.
+ * *        @see [withGlobalLock], [withTryGlobalLock]
+ * *    Implement lock escalation. If a single thread has locked too many entities,
+ * *    escalate its lock to be a global lock.
+ * *        @see [globalLockThreshold] and related code
+ *
+ * Not implemented:
+ * *    Implement protection from deadlocks (but not taking into account possible locks outside [EntityLocker]).
  */
 class EntityLocker<K : Any>(private val globalLockThreshold: Int = 10) {
     private val keyToLockCount = mutableMapOf<K, LockCount>()
@@ -23,8 +50,7 @@ class EntityLocker<K : Any>(private val globalLockThreshold: Int = 10) {
      * ensuring that at most one [Thread] executes protected code on that entity
      * If there’s a concurrent request to lock the same entity, the other thread
      * should wait until the entity becomes available.
-     * Concurrent execution of protected code on different entities is allowed.
-     * Reentrant invocation is allowed.
+     * @return the result of execution
      */
     inline fun <T> withLock(key: K, protectedCode: () -> T): T = lock(key).run {
         try {
@@ -34,6 +60,17 @@ class EntityLocker<K : Any>(private val globalLockThreshold: Int = 10) {
         }
     }
 
+    /**
+     * tries to start execution of [protectedCode] exclusively accessing entity determined by [key]
+     * within at most [timeout] milliseconds
+     * ensuring that at most one [Thread] executes protected code on that entity
+     * If there’s a concurrent request to lock the same entity, the other thread
+     * should wait until the entity becomes available.
+     *
+     * @return
+     * *    [protectedCode] execution was started -> [Success] instance wrapping the result
+     * *    unable to start execution during [timeout] -> [TimeoutExceeded] object
+     */
     inline fun <T> withTryLock(
         key: K,
         timeout: Long,
@@ -51,7 +88,7 @@ class EntityLocker<K : Any>(private val globalLockThreshold: Int = 10) {
      * ensuring that at most one [Thread] executes protected code on any entity
      * If there’s a concurrent request to lock any entity, the other thread
      * should wait until the entity becomes available.
-     * Reentrant invocation is allowed.
+     * @return the result of execution
      */
     inline fun <T> withGlobalLock(protectedCode: () -> T): T = globalLock().run {
         try {
@@ -84,13 +121,6 @@ class EntityLocker<K : Any>(private val globalLockThreshold: Int = 10) {
     } ?: TimeoutExceeded
 
     /**
-     * Acquires the lock on [key] according to the following strategy:
-     * lock on [key] isn't held by another thread -> acquires and returns immediately
-     * lock on [key] is already held by [Thread.currentThread] -> increment associated [LockCount]
-     *      and returns immediately
-     * else -> the current thread becomes disabled for thread scheduling purposes and lies dormant until the locks
-     *      has been acquired, at which time the locks hold count is set to one.
-     *
      * This fun is internal in order to prevent [EntityLocker] user from lock leaks
      */
     @PublishedApi
@@ -121,6 +151,9 @@ class EntityLocker<K : Any>(private val globalLockThreshold: Int = 10) {
         }
     }
 
+    /**
+     * This fun is internal in order to prevent [EntityLocker] user from lock leaks
+     */
     @PublishedApi
     internal fun tryLock(key: K, timeout: Long): Boolean = globalLock.withLock {
         val start = System.currentTimeMillis()
@@ -135,12 +168,18 @@ class EntityLocker<K : Any>(private val globalLockThreshold: Int = 10) {
         } else false
     }
 
+    /**
+     * This fun is internal in order to prevent [EntityLocker] user from lock leaks
+     */
     @PublishedApi
     internal fun globalLock(): Unit = globalLock.withLock {
         while (isGloballyLocked() || isAnyLocked()) globalMonitor.await()
         acquireGlobalLock()
     }
 
+    /**
+     * This fun is internal in order to prevent [EntityLocker] user from misuse e.g. attempting to release not held lock
+     */
     @PublishedApi
     internal fun globalUnlock(): Unit = globalLock.withLock {
         globalLockCount?.let {
@@ -154,6 +193,9 @@ class EntityLocker<K : Any>(private val globalLockThreshold: Int = 10) {
         }
     }
 
+    /**
+     * This fun is internal in order to prevent [EntityLocker] user from lock leaks
+     */
     @PublishedApi
     internal fun tryGlobalLock(timeout: Long): Boolean = globalLock.withLock {
         if (awaitFor(timeout) { !isGloballyLocked() && !isAnyLocked() }) {
