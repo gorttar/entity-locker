@@ -32,6 +32,10 @@ class EntityLocker<K : Any> {
         }
     }
 
+    inline fun <T> withTryLock(key: K, timeout: Long, protectedCode: () -> T): TryLockResult<T> {
+        TODO()
+    }
+
     /**
      * executes [protectedCode] exclusively
      * ensuring that at most one [Thread] executes protected code on any entity
@@ -45,6 +49,10 @@ class EntityLocker<K : Any> {
         } finally {
             globalUnlock()
         }
+    }
+
+    inline fun <T> withTryGlobalLock(timeout: Long, protectedCode: () -> T): TryLockResult<T> {
+        TODO()
     }
 
     /**
@@ -73,8 +81,8 @@ class EntityLocker<K : Any> {
     @PublishedApi
     internal fun unlock(key: K): Unit = globalLock.withLock {
         if (keyToLockCount[key]?.thread === Thread.currentThread()) {
-            val lockCont = keyToLockCount[key]!!.dec()
-            if (lockCont.count == 0) {
+            val lockCont = keyToLockCount[key]?.dec()
+            if (lockCont?.count == 0) {
                 keyToLockCount.remove(key)
                 globalMonitor.signalAll()
             }
@@ -112,3 +120,7 @@ private class LockCount {
     fun inc() = apply { count++ }
     fun dec() = apply { count-- }
 }
+
+sealed class TryLockResult<out V>
+data class Success<V>(val v: V) : TryLockResult<V>()
+object TimeoutExceeded : TryLockResult<Nothing>()
