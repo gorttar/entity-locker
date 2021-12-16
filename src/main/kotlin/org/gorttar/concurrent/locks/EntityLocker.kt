@@ -1,5 +1,6 @@
 package org.gorttar.concurrent.locks
 
+import java.util.concurrent.TimeUnit.MILLISECONDS
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
@@ -32,9 +33,17 @@ class EntityLocker<K : Any> {
         }
     }
 
-    inline fun <T> withTryLock(key: K, timeout: Long, protectedCode: () -> T): TryLockResult<T> {
-        TODO()
-    }
+    inline fun <T> withTryLock(
+        key: K,
+        timeout: Long,
+        protectedCode: () -> T
+    ): TryLockResult<T> = tryLock(key, timeout).takeIf { it }?.run {
+        try {
+            Success(protectedCode())
+        } finally {
+            unlock(key)
+        }
+    } ?: TimeoutExceeded
 
     /**
      * executes [protectedCode] exclusively
@@ -67,10 +76,7 @@ class EntityLocker<K : Any> {
      */
     @PublishedApi
     internal fun lock(key: K): Unit = globalLock.withLock {
-        while (
-            (keyToLockCount[key]?.count ?: 0) > 0 && keyToLockCount[key]?.thread !== Thread.currentThread() ||
-            isGloballyLocked()
-        ) globalMonitor.await()
+        while (isLocked(key) || isGloballyLocked()) globalMonitor.await()
         keyToLockCount.computeIfAbsent(key) { LockCount() }.inc()
     }
 
@@ -90,13 +96,19 @@ class EntityLocker<K : Any> {
     }
 
     @PublishedApi
+    internal fun tryLock(key: K, timeout: Long): Boolean = globalLock.withLock {
+        if (isLocked(key) || isGloballyLocked()) globalMonitor.await(timeout, MILLISECONDS)
+        if (!isLocked(key) && !isGloballyLocked()) {
+            keyToLockCount.computeIfAbsent(key) { LockCount() }.inc()
+            true
+        } else false
+    }
+
+    @PublishedApi
     internal fun globalLock(): Unit = globalLock.withLock {
         while (isGloballyLocked() || keyToLockCount.values.any { it.count > 0 }) globalMonitor.await()
         globalLockCount = (globalLockCount ?: LockCount()).inc()
     }
-
-    private fun isGloballyLocked() =
-        (globalLockCount?.count ?: 0) > 0 && globalLockCount?.thread !== Thread.currentThread()
 
     @PublishedApi
     internal fun globalUnlock(): Unit = globalLock.withLock {
@@ -110,6 +122,12 @@ class EntityLocker<K : Any> {
             }
         }
     }
+
+    private fun isGloballyLocked() =
+        (globalLockCount?.count ?: 0) > 0 && globalLockCount?.thread !== Thread.currentThread()
+
+    private fun isLocked(key: K) =
+        (keyToLockCount[key]?.count ?: 0) > 0 && keyToLockCount[key]?.thread !== Thread.currentThread()
 }
 
 private class LockCount {

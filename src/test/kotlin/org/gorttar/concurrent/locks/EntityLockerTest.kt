@@ -22,9 +22,9 @@ internal class EntityLockerTest {
     private val locker = EntityLocker<String>()
     private val eventQueue = ConcurrentLinkedQueue<Event>()
     private val protectedCode: () -> Unit = {
-        eventQueue.offer(Event(start))
+        eventQueue += Event(start)
         Thread.sleep(twoTicksDurationMs)
-        eventQueue.offer(Event(end))
+        eventQueue += Event(end)
     }
     private val fooThread = Thread { locker.withLock("foo", protectedCode) }
 
@@ -114,9 +114,9 @@ internal class EntityLockerTest {
         // given
         val fooThread1 = Thread {
             result1 = locker.withTryLock("foo", twoTicksDurationMs) {
-                eventQueue.offer(Event(start))
+                eventQueue += Event(start)
                 Thread.sleep(threeTicksDurationMs)
-                eventQueue.offer(Event(end))
+                eventQueue += Event(end)
             }
         }
         val fooThread2 = Thread { result2 = locker.withTryLock("foo", tickDurationMs, protectedCode) }
